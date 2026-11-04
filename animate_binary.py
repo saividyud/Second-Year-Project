@@ -309,6 +309,6 @@ def update(frame):
 ani = animation.FuncAnimation(fig, update, frames=M2_NUM, interval=100, blit=True)
 
 # Saving the animation
-ani.save('binary_animation.mp4', writer='ffmpeg', fps=1)
+ani.save('binary_animation.mp4', writer='ffmpeg', fps=30)
 
 # plt.show()

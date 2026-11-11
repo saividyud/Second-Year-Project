@@ -15,40 +15,6 @@ def M_L_relation(M_1, M_2):
     else:
         return (M_1/M_2)**3
 
-# Creating function to calculate the normalized intensities of each output given photonic lantern outputs and divisor output
-def calculate_normalized_intensities(outputs, divisor_output, wav_range) -> np.ndarray:
-    '''
-    Calculates the normalized intensities of each output given photonic lantern outputs and divisor output.as_integer_ratio
-
-    Parameters
-    ----------
-    outputs : np.ndarray 
-        Output from `device.calculate_outputs()` [number of wavelength channels, number of outputs]
-    divisor_output : int
-        Index of the output to normalize by
-    wav_range : np.ndarray
-        Wavelength range [number of wavelength channels]
-
-    Returns
-    -------
-    normalized_intensities : np.ndarray
-        Normalized intensities of each output [number of outputs]
-    '''
-    # Initializing array to store the total normalized intensities
-    tot_norm_outputs = []
-
-    # Iterating through each photonic lantern output
-    for i in range(outputs.shape[1]):
-        # Calculating the continuum intensity for the output (basically far from the spectral features)
-        continuum_intensity = (outputs[0, i] + outputs[1, i]) / 2
-
-        # Calculating the total normalized intensity for the output
-        integral = np.abs(np.sum( (outputs[:, i] - continuum_intensity)/outputs[:, divisor_output] * (wav_range[1] - wav_range[0]) ))
-
-        tot_norm_outputs.append(integral)
-
-    return np.array(tot_norm_outputs)
-
 # Function to define photonic lantern device
 def create_photonic_lantern_device(
     N_DIM, 
@@ -164,3 +130,37 @@ def create_photonic_lantern_device(
     print('Projected scene onto optical transfer function\n')
 
     return pupil_grid, focal_grid, aperture, otf, matrix, device, scene, scene_projector
+
+# Creating function to calculate the normalized intensities of each output given photonic lantern outputs and divisor output
+def calculate_normalized_intensities(outputs, divisor_output, wav_range) -> np.ndarray:
+    '''
+    Calculates the normalized intensities of each output given photonic lantern outputs and divisor output.as_integer_ratio
+
+    Parameters
+    ----------
+    outputs : np.ndarray 
+        Output from `device.calculate_outputs()` [number of wavelength channels, number of outputs]
+    divisor_output : int
+        Index of the output to normalize by
+    wav_range : np.ndarray
+        Wavelength range [number of wavelength channels]
+
+    Returns
+    -------
+    normalized_intensities : np.ndarray
+        Normalized intensities of each output [number of outputs]
+    '''
+    # Initializing array to store the total normalized intensities
+    tot_norm_outputs = []
+
+    # Iterating through each photonic lantern output
+    for i in range(outputs.shape[1]):
+        # Calculating the continuum intensity for the output (basically far from the spectral features)
+        continuum_intensity = (outputs[0, i] + outputs[1, i]) / 2
+
+        # Calculating the total normalized intensity for the output
+        integral = np.abs(np.sum( (outputs[:, i] - continuum_intensity)/outputs[:, divisor_output] * (wav_range[1] - wav_range[0]) ))
+
+        tot_norm_outputs.append(integral)
+
+    return np.array(tot_norm_outputs)

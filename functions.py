@@ -9,7 +9,7 @@ from PLsim.system.lantern import generate_unitary_matrix
 import hcipy as hc
 
 # Defining the mass-luminosity relation
-def M_L_relation(M_1, M_2):
+def M_L_relation(M_1, M_2) -> float:
     if M_1 < 2:
         return (M_1/M_2)**5
     else:
@@ -17,19 +17,20 @@ def M_L_relation(M_1, M_2):
 
 # Function to define photonic lantern device
 def create_photonic_lantern_device(
-    N_DIM, 
-    DIAMETER, 
-    FOCAL_RESOLUTION, 
-    WAV_MIDDLE, 
-    N_CORE, 
-    N_CLAD, 
-    R_CORE, 
-    FOCAL_LENGTH, 
-    N_OUTPUTS, N_SPEC) -> tuple[
+    N_DIM,
+    DIAMETER,
+    FOCAL_RESOLUTION,
+    WAV_MIDDLE,
+    N_CORE,
+    N_CLAD,
+    R_CORE,
+    FOCAL_LENGTH,
+    N_SPEC) -> tuple[
         hc.CartesianGrid, 
         hc.CartesianGrid, 
         hc.Field, 
-        OTF, 
+        OTF,
+        int,
         np.ndarray, 
         Device, 
         Scene, 
@@ -40,23 +41,21 @@ def create_photonic_lantern_device(
     Parameters
     ----------
     N_DIM : int
-        Number of dimensions of the pupil grid
+        Number of pixels in the pupil grid
     DIAMETER : float
-        Diameter of the pupil grid
+        Diameter of the telescope aperture for pupil grid [m]
     FOCAL_RESOLUTION : int
-        Resolution of the focal grid
+        Resolution of the focal grid (make sure this samples LP modes enough but also not truncate the outer parts) [m]
     WAV_MIDDLE : float
-        Middle wavelength of the wavelength range
+        Middle wavelength of the wavelength range [nm]
     N_CORE : float
-        Core index of the fiber
+        Index of refraction of the core
     N_CLAD : float
-        Clad index of the fiber
+        Index of refraction of the cladding
     R_CORE : float
-        Core radius of the fiber
+        Core radius [m]
     FOCAL_LENGTH : float
-        Focal length of the fiber
-    N_OUTPUTS : int
-        Number of outputs of the photonic lantern
+        Focal length of the telescope (initial value, OTF.from_fiber_params will find an optimal focal ratio) [m]
     N_SPEC : int
         Number of wavelength channels
 
@@ -70,6 +69,8 @@ def create_photonic_lantern_device(
         Aperture of the fiber
     otf : OTF
         Optical transfer function
+    N_OUTPUTS : int
+        Number of photonic lantern outputs
     matrix : np.ndarray
         Unitary matrix
     device : Device
@@ -107,6 +108,7 @@ def create_photonic_lantern_device(
         FOCAL_LENGTH, aperture,
         optimize_focal_length=False
     )
+    N_OUTPUTS = otf.focal_modes.shape[0]
     print('Created optical transfer function\n')
 
     # Computing OTF
@@ -129,7 +131,7 @@ def create_photonic_lantern_device(
     scene_projector = SceneProjector(otf, scene)
     print('Projected scene onto optical transfer function\n')
 
-    return pupil_grid, focal_grid, aperture, otf, matrix, device, scene, scene_projector
+    return pupil_grid, focal_grid, aperture, otf, N_OUTPUTS, matrix, device, scene, scene_projector
 
 # Creating function to calculate the normalized intensities of each output given photonic lantern outputs and divisor output
 def calculate_normalized_intensities(outputs, divisor_output, wav_range) -> np.ndarray:
@@ -164,3 +166,70 @@ def calculate_normalized_intensities(outputs, divisor_output, wav_range) -> np.n
         tot_norm_outputs.append(integral)
 
     return np.array(tot_norm_outputs)
+
+# Function to calculate the spectroastrometric signal according to option 2
+def calculate_signal(outputs, wav_range) -> np.ndarray:
+    '''
+    Calculates the signal of each output given photonic lantern outputs and divisor output.
+
+    Parameters
+    ----------
+    outputs : np.ndarray 
+        Output from `device.calculate_outputs()` [number of wavelength channels, number of outputs]
+    wav_range : np.ndarray
+        Wavelength range [number of wavelength channels]
+
+    Returns
+    -------
+    signals : np.ndarray
+        Signals of each output [number of outputs]
+    '''
+    # Initializing array to store the signals
+    signals = []
+
+    # Finding the total intensity at each wavelength channel for all the outputs
+    total_intensity = np.sum(outputs, axis=1)
+
+    # Iterating through each photonic lantern output
+    for i in range(outputs.shape[1]):
+        # Calculating fractional intensity of the port (port intensity/total intensity)
+        fractional_intensity = outputs[:, i] / total_intensity
+
+        # Calculating the continuum fractional intensity for the output (basically far from the spectral features)
+        continuum_fractional_intensity = (fractional_intensity[0] + fractional_intensity[-1]) / 2
+
+        # Calculating the signal for the output
+        integral = np.sum( np.abs((fractional_intensity - continuum_fractional_intensity) * (wav_range[1] - wav_range[0])) )
+
+        signals.append(integral)
+
+    return np.array(signals)
+
+# Creating a spectrum generating function
+def create_spectrum(cont_flux, line_depth, line_middle, line_width, wavelength_range) -> np.ndarray:
+    '''
+    Creates a Gaussian absorption or emission line spectrum with the given parameters.
+
+    Parameters
+    ----------
+    cont_flux : float
+        Flux of the continuum [arbitrary units]
+    line_depth : float
+        Depth of the line (fraction of continuum flux)
+    line_middle : float
+        Middle wavelength of the line [length units]
+    line_width : float
+        Width of the line (FWHM) [length units]
+    wavelength_range : np.ndarray
+        Wavelength range [length units]
+
+    Returns
+    -------
+    spectrum : np.ndarray
+        Spectrum [arbitrary units] (same length as wavelength_range)
+    '''
+    # Creating the spectrum
+    spectrum = cont_flux * np.ones_like(wavelength_range)
+    spectrum -= cont_flux * (1 - line_depth) * np.exp(-0.5 * (wavelength_range - line_middle)**2 / line_width**2)
+
+    return spectrum

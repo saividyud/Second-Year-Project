@@ -183,6 +183,15 @@ class PhotonicLanternFitting:
                 print('\nCorrelation matrix:')
                 print(pd.DataFrame(correlation, index=param_names, columns=param_names).to_string(float_format='%.2f'))
 
+                # Ranking each parameter pair once (upper triangle, excluding the diagonal) by the magnitude of its correlation
+                rows, cols = np.triu_indices(n_params, k=1)
+                top_pairs = np.argsort(np.abs(correlation[rows, cols]))[::-1][:3]
+
+                print('\nTop three correlations:')
+                for k in top_pairs:
+                    i, j = rows[k], cols[k]
+                    print(f'    {param_names[i]} & {param_names[j]}: {correlation[i, j]:+.2f}')
+
             final_results = self.stage4.x
 
         return final_results

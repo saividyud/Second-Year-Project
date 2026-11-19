@@ -5,10 +5,46 @@ import pandas as pd
 
 from tqdm import tqdm
 import time as t
+import pickle
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Custom libraries
 import functions
 from PhotonicLanternDevice import PhotonicLanternDevice
+
+# Fitter instance held by each worker process of the stage 2 process pool
+_stage2_worker_fitter = None
+
+def _init_stage2_worker(pickled_fitter : bytes) -> None:
+    '''
+    Initializes a stage 2 worker process by storing its copy of the fitter (sent once per process instead of once per task).
+
+    The fitter arrives pre-pickled because the parent sends each worker's start-up arguments one worker at a time and waits for each to be read.
+    Raw bytes are read instantly, whereas an unpickled fitter would make each worker import hcipy/PLsim before the next worker could start.
+
+    Parameters
+    ----------
+    pickled_fitter : bytes
+        Pickled fitter instance (with the observation already stored) to use in this worker process
+    '''
+    global _stage2_worker_fitter
+    _stage2_worker_fitter = pickle.loads(pickled_fitter)
+
+def _stage2_worker(position : np.ndarray) -> optimize.OptimizeResult:
+    '''
+    Runs one stage 2 position fit in a worker process.
+
+    Parameters
+    ----------
+    position : np.ndarray
+        Starting positions of both the stars [mas] (x1, y1, x2, y2)
+
+    Returns
+    -------
+    fit : optimize.OptimizeResult
+        Result of the least squares position fit
+    '''
+    return _stage2_worker_fitter._fit_positions(position)
 
 class PhotonicLanternFitting:
     '''
@@ -69,7 +105,7 @@ class PhotonicLanternFitting:
 
         return result
 
-    def binary_fitting(self, observed_fractional_intensities : np.ndarray, observed_total : np.ndarray, guess : np.ndarray, M1 : float, single_star_tolerance : float = 1e-3, refine : bool = True, true_values : list[float] = None) -> np.ndarray:
+    def binary_fitting(self, observed_fractional_intensities : np.ndarray, observed_total : np.ndarray, guess : np.ndarray, M1 : float, single_star_tolerance : float = 1e-3, refine : bool = True, true_values : list[float] = None, cpu : int | None = None) -> np.ndarray:
         '''
         Fits a binary signal to the observed photonic lantern outputs.
 
@@ -91,6 +127,8 @@ class PhotonicLanternFitting:
             Whether to refine the fit after the binary fitting, default True
         true_values : list[float], optional
             True values of the parameters (x1, y1, x2, y2, F1, depth of line 1, center of line 1, width of line 1, M2, depth of line 2, center of line 2, width of line 2), default None
+        cpu : int, optional
+            Number of worker processes to run stage 2 in parallel with, default None (runs stage 2 serially)
 
         Returns
         -------
@@ -118,7 +156,10 @@ class PhotonicLanternFitting:
 
         # Stage 2: Use fitted single star position and grid of Star 2 positions to find local minima and solve for spectra using linear least squares
         init_time = t.time()
-        self.stage2 = self._binary_fitting_stage2(self.stage1)
+        if cpu is None:
+            self.stage2 = self._binary_fitting_stage2(self.stage1)
+        else:
+            self.stage2 = self._binary_fitting_stage2_parallel(self.stage1, cpu)
         print(f'Stage 2:    Star 1 position = {np.round(self.stage2.x[0:2], 3)} mas')
         print(f'            Star 2 position = {np.round(self.stage2.x[2:4], 3)} mas')
         print(f'            SSR = {self.stage2.cost:.3e}')
@@ -329,12 +370,7 @@ class PhotonicLanternFitting:
                 for y2 in y2_grid:
                     position = np.array([stage1.x[0], stage1.x[1], x2, y2])
 
-                    fit = optimize.least_squares(
-                        lambda x: self._position_residuals(x, self.observed_fractional_intensities),
-                        x0=position,
-                        bounds=([-self.bounded_edge] * 4, [self.bounded_edge] * 4),
-                        x_scale=self.position_scale
-                    )
+                    fit = self._fit_positions(position)
 
                     if best_fit is None or fit.cost < best_fit.cost:
                         best_fit = fit
@@ -342,6 +378,68 @@ class PhotonicLanternFitting:
                     pbar.update(1)
 
         return best_fit
+
+    def _binary_fitting_stage2_parallel(self, stage1 : optimize.OptimizeResult, cpu : int) -> optimize.OptimizeResult:
+        '''
+        Parallel version of `self._binary_fitting_stage2` that distributes the grid of Star 2 starting positions across multiple processes.
+
+        On macOS and Windows, worker processes are spawned by re-importing the calling script, so a script calling this must guard its entry point with `if __name__ == '__main__':`.
+
+        Parameters
+        ----------
+        stage1 : optimize.OptimizeResult
+            Result of the single star fit
+        cpu : int
+            Number of worker processes
+
+        Returns
+        -------
+        stage2 : optimize.OptimizeResult
+        '''
+        # Defining a grid of Star 2 positions
+        x2_grid = np.linspace(-self.bounded_edge, self.bounded_edge, self.n_grid)
+        y2_grid = np.linspace(-self.bounded_edge, self.bounded_edge, self.n_grid)
+
+        positions = [np.array([stage1.x[0], stage1.x[1], x2, y2]) for x2 in x2_grid for y2 in y2_grid]
+
+        with ProcessPoolExecutor(max_workers=cpu, initializer=_init_stage2_worker, initargs=(pickle.dumps(self),)) as executor:
+            futures = [executor.submit(_stage2_worker, position) for position in positions]
+
+            with tqdm(total=len(futures), desc=f'Binary fitting stage 2 (position fitting, {cpu} processes)') as pbar:
+                for _ in as_completed(futures):
+                    pbar.update(1)
+
+            fits = [future.result() for future in futures]
+
+        # Selecting the best fit in grid order so ties resolve the same way as the serial version
+        best_fit = None
+
+        for fit in fits:
+            if best_fit is None or fit.cost < best_fit.cost:
+                best_fit = fit
+
+        return best_fit
+
+    def _fit_positions(self, position : np.ndarray) -> optimize.OptimizeResult:
+        '''
+        Fits the positions of both stars from one starting point, with the spectra solved linearly within.
+
+        Parameters
+        ----------
+        position : np.ndarray
+            Starting positions of both the stars [mas] (x1, y1, x2, y2)
+
+        Returns
+        -------
+        fit : optimize.OptimizeResult
+            Result of the least squares position fit
+        '''
+        return optimize.least_squares(
+            lambda x: self._position_residuals(x, self.observed_fractional_intensities),
+            x0=position,
+            bounds=([-self.bounded_edge] * 4, [self.bounded_edge] * 4),
+            x_scale=self.position_scale
+        )
 
     def _binary_fitting_stage3(self, stage2 : optimize.OptimizeResult, guess : np.ndarray) -> tuple[optimize.OptimizeResult, optimize.OptimizeResult, np.ndarray]:
         '''

@@ -5,46 +5,12 @@ import pandas as pd
 
 from tqdm import tqdm
 import time as t
-import pickle
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import sys
+import concurrent.futures as cf
 
 # Custom libraries
 import functions
 from PhotonicLanternDevice import PhotonicLanternDevice
-
-# Fitter instance held by each worker process of the stage 2 process pool
-_stage2_worker_fitter = None
-
-def _init_stage2_worker(pickled_fitter : bytes) -> None:
-    '''
-    Initializes a stage 2 worker process by storing its copy of the fitter (sent once per process instead of once per task).
-
-    The fitter arrives pre-pickled because the parent sends each worker's start-up arguments one worker at a time and waits for each to be read.
-    Raw bytes are read instantly, whereas an unpickled fitter would make each worker import hcipy/PLsim before the next worker could start.
-
-    Parameters
-    ----------
-    pickled_fitter : bytes
-        Pickled fitter instance (with the observation already stored) to use in this worker process
-    '''
-    global _stage2_worker_fitter
-    _stage2_worker_fitter = pickle.loads(pickled_fitter)
-
-def _stage2_worker(position : np.ndarray) -> optimize.OptimizeResult:
-    '''
-    Runs one stage 2 position fit in a worker process.
-
-    Parameters
-    ----------
-    position : np.ndarray
-        Starting positions of both the stars [mas] (x1, y1, x2, y2)
-
-    Returns
-    -------
-    fit : optimize.OptimizeResult
-        Result of the least squares position fit
-    '''
-    return _stage2_worker_fitter._fit_positions(position)
 
 class PhotonicLanternFitting:
     '''
@@ -288,17 +254,8 @@ class PhotonicLanternFitting:
         residuals : np.ndarray
             Flattened residual vector of the differences between the observed and model fractional intensities
         '''
-        # Extracting positions of the stars
-        star1_x, star1_y, star2_x, star2_y = x
-        star1_position = np.array([star1_x, star1_y])
-        star2_position = np.array([star2_x, star2_y])
-
-        # Creating a flat spectrum for the stars
-        flat_spectrum = np.ones(self.lantern.N_SPEC) # [arbitrary units]
-
-        # Calculating the outputs of the star positions
-        star1_flat_output = self.lantern.calculate_photonic_lantern_outputs(np.array([star1_position]), np.array([flat_spectrum]))
-        star2_flat_output = self.lantern.calculate_photonic_lantern_outputs(np.array([star2_position]), np.array([flat_spectrum]))
+        # Calculating the flat spectrum outputs of both star positions in a single pass
+        star1_flat_output, star2_flat_output = self.lantern.calculate_flat_outputs_per_body(np.reshape(x, (2, 2)))
 
         # Solving the spectra using linear least squares
         spectra, model_intensities = self._solve_spectra(star1_flat_output, star2_flat_output, observed_fractional_intensities)
@@ -381,7 +338,7 @@ class PhotonicLanternFitting:
 
     def _binary_fitting_stage2_parallel(self, stage1 : optimize.OptimizeResult, cpu : int) -> optimize.OptimizeResult:
         '''
-        Parallel version of `self._binary_fitting_stage2` that distributes the grid of Star 2 starting positions across multiple processes.
+        Parallel version of `self._binary_fitting_stage2` that splits the grid of Star 2 starting positions into one group per CPU and fits each group in its own process.
 
         On macOS and Windows, worker processes are spawned by re-importing the calling script, so a script calling this must guard its entry point with `if __name__ == '__main__':`.
 
@@ -400,21 +357,55 @@ class PhotonicLanternFitting:
         x2_grid = np.linspace(-self.bounded_edge, self.bounded_edge, self.n_grid)
         y2_grid = np.linspace(-self.bounded_edge, self.bounded_edge, self.n_grid)
 
-        positions = [np.array([stage1.x[0], stage1.x[1], x2, y2]) for x2 in x2_grid for y2 in y2_grid]
+        positions = np.array([[stage1.x[0], stage1.x[1], x2, y2] for x2 in x2_grid for y2 in y2_grid])
 
-        with ProcessPoolExecutor(max_workers=cpu, initializer=_init_stage2_worker, initargs=(pickle.dumps(self),)) as executor:
-            futures = [executor.submit(_stage2_worker, position) for position in positions]
+        # Splitting the positions into contiguous groups (one per CPU)
+        position_groups = np.array_split(positions, cpu)
 
-            with tqdm(total=len(futures), desc=f'Binary fitting stage 2 (position fitting, {cpu} processes)') as pbar:
-                for _ in as_completed(futures):
+        # Worker progress bars only render in a terminal (worker output does not reach a notebook), so falling back to a bar over completed groups otherwise
+        disable_worker_tqdm = not sys.stdout.isatty()
+
+        with cf.ProcessPoolExecutor(max_workers=cpu) as executor:
+            futures = [executor.submit(self._worker_binary_fitting_stage2, group, worker_id, disable_worker_tqdm) for worker_id, group in enumerate(position_groups)]
+
+            with tqdm(total=len(futures), desc=f'Binary fitting stage 2 (position fitting, {cpu} CPUs)', disable=not disable_worker_tqdm) as pbar:
+                for _ in cf.as_completed(futures):
                     pbar.update(1)
 
-            fits = [future.result() for future in futures]
+            group_fits = [future.result() for future in futures]
 
-        # Selecting the best fit in grid order so ties resolve the same way as the serial version
+        # Selecting the best fit in group order so ties resolve the same way as the serial version
         best_fit = None
 
-        for fit in fits:
+        for fit in group_fits:
+            if best_fit is None or fit.cost < best_fit.cost:
+                best_fit = fit
+
+        return best_fit
+
+    def _worker_binary_fitting_stage2(self, position_group : np.ndarray, worker_id : int, disable_tqdm : bool) -> optimize.OptimizeResult:
+        '''
+        Fits the positions of both stars from each starting point in a group (run in a worker process by `self._binary_fitting_stage2_parallel`).
+
+        Parameters
+        ----------
+        position_group : np.ndarray
+            Starting positions of both the stars [mas] (N_POSITIONS x 4) (x1, y1, x2, y2)
+        worker_id : int
+            Index of the worker (sets the row of its progress bar)
+        disable_tqdm : bool
+            Whether to disable the progress bar of the worker
+
+        Returns
+        -------
+        best_fit : optimize.OptimizeResult
+            Lowest cost position fit of the group
+        '''
+        best_fit = None
+
+        for position in tqdm(position_group, desc=f'CPU {worker_id + 1}', position=worker_id, disable=disable_tqdm, leave=False, dynamic_ncols=True):
+            fit = self._fit_positions(position)
+
             if best_fit is None or fit.cost < best_fit.cost:
                 best_fit = fit
 

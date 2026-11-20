@@ -195,3 +195,29 @@ class PhotonicLanternDevice:
         outputs *= 1 + NOISE * rng.standard_normal(outputs.shape)
 
         return outputs
+
+    def calculate_flat_outputs_per_body(self, positions : np.ndarray) -> np.ndarray:
+        '''
+        Calculates the outputs of each body separately given a flat spectrum of ones, projecting all bodies in a single pass over the OTF.
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            Array of positions [mas] (N_BODIES x 2)
+
+        Returns
+        -------
+        outputs : np.ndarray
+            Array of output spectra from each photonic lantern port for each body (N_BODIES x N_SPEC x N_PORTS)
+        '''
+        # Computing the mutual intensities of each body (one scalar call per body is faster than one vectorized call)
+        J = np.stack([self.scene.J_point(x * self.MAS_TO_RAD, y * self.MAS_TO_RAD) for x, y in positions], axis=1) # (N_PIXELS, N_BODIES)
+
+        # Projecting all bodies onto the OTF in a single contraction (equivalent to self.scene_projector.compute_point)
+        projected = np.tensordot(self.otf.full_ccpupils, J, axes=([2], [0])) # (N_PORTS, N_PORTS, N_BODIES)
+
+        # Passing the projected bodies through the device: I = T C T^H for each wavelength (equivalent to self.device.calculate_outputs, which is slow with a batch dimension)
+        T = self.device.matrix # (N_SPEC, N_PORTS, N_PORTS)
+        outputs = np.real(np.einsum('wkn,wknb->bwk', T.conj(), np.tensordot(T, projected, axes=([2], [0])))) # (N_BODIES, N_SPEC, N_PORTS)
+
+        return outputs

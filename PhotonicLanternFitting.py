@@ -526,26 +526,63 @@ class PhotonicLanternFitting:
         else:
             fitted_M2 = self.M1 * (line2_result.x[0] / line1_result.x[0])**(1/3) # (M_2)
 
-        F1_guess = line1_result.x[0]
+        # [x1, y1, x2, y2, F1, depth of line 1, center of line 1, width of line 1, M2, depth of line 2, center of line 2, width of line 2]
+        x0 = np.array([*best_positions, line1_result.x[0], *line1_result.x[1:], fitted_M2, *line2_result.x[1:]])
 
+        return self._refine(x0)
+
+    def binary_fitting_warm_start(self, observed_fractional_intensities : np.ndarray, observed_total : np.ndarray, x0 : np.ndarray, M1 : float) -> optimize.OptimizeResult:
+        '''
+        Refines all the parameters of the binary starting from a known nearby solution (e.g. the true binary or the previous time step), skipping stages 1 to 3.
+
+        Parameters
+        ----------
+        observed_fractional_intensities : np.ndarray
+            (N_SPEC x N_OUTPUTS) matrix of observed fractional intensities from photonic lantern
+        observed_total : np.ndarray
+            (N_SPEC,) total observed intensity summed over all outputs (before normalizing to fractions)
+        x0 : np.ndarray
+            Starting parameters (x1, y1, x2, y2, F1, a1, c1, w1, M2, a2, c2, w2)
+        M1 : float
+            Mass of Star 1
+
+        Returns
+        -------
+        result : optimize.OptimizeResult
+            Result of the minimization with parameters (x1, y1, x2, y2, F1, a1, c1, w1, M2, a2, c2, w2)
+        '''
+        self.observed_fractional_intensities = observed_fractional_intensities
+        self.observed_total = observed_total
+        self.M1 = M1
+
+        return self._refine(np.asarray(x0, dtype=float))
+
+    def _refine(self, x0 : np.ndarray) -> optimize.OptimizeResult:
+        '''
+        Nonlinear least squares over all the parameters of the binary against the stored observation.
+
+        Parameters
+        ----------
+        x0 : np.ndarray
+            Starting parameters (x1, y1, x2, y2, F1, a1, c1, w1, M2, a2, c2, w2)
+
+        Returns
+        -------
+        result : optimize.OptimizeResult
+            Result of the minimization
+        '''
         edge = self.bounded_edge
         wav_min, wav_max = self.wavelength_range[0], self.wavelength_range[-1]
 
-        # Performing the least squares fit
-        stage4 = optimize.least_squares(
-            fun=lambda params: self._binary_objective(params, self.observed_fractional_intensities, self.observed_total, self.M1),
-            x0=(
-                # [x1, y1, x2, y2, F1, depth of line 1, center of line 1, width of line 1, M2, depth of line 2, center of line 2, width of line 2]
-                *best_positions, F1_guess, *line1_result.x[1:], fitted_M2, *line2_result.x[1:]
-            ),
-            bounds=(
-                [-edge, -edge, -edge, -edge, 0, 0, wav_min, 1e-6, 0, 0, wav_min, 1e-6],
-                [edge, edge, edge, edge, np.inf, 2, wav_max, 1, np.inf, 2, wav_max, 1]
-            ),
-            x_scale=[*[self.position_scale] * 4, 0.1 * F1_guess, *self.line_scale, self.mass_scale, *self.line_scale],
-        )
+        lower = np.array([-edge, -edge, -edge, -edge, 0, 0, wav_min, 1e-6, 0, 0, wav_min, 1e-6])
+        upper = np.array([edge, edge, edge, edge, np.inf, 2, wav_max, 1, np.inf, 2, wav_max, 1])
 
-        return stage4
+        return optimize.least_squares(
+            fun=lambda params: self._binary_objective(params, self.observed_fractional_intensities, self.observed_total, self.M1),
+            x0=np.clip(x0, lower, upper),
+            bounds=(lower, upper),
+            x_scale=[*[self.position_scale] * 4, 0.1 * x0[4], *self.line_scale, self.mass_scale, *self.line_scale],
+        )
 
     def _binary_objective(self, params : np.ndarray, observed_fractional_intensities : np.ndarray, observed_total : np.ndarray, M1 : float) -> np.ndarray:
         '''

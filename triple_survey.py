@@ -291,7 +291,7 @@ if __name__ == '__main__':
     parser.add_argument('--r2', type=float, default=None, help='Projected distance between star 1 and star 2 in mas (default: all of r2s)')
     parser.add_argument('--theta2', type=float, default=None, help='Angle between star 2 and the x-axis in degrees (default: all of theta2s)')
     parser.add_argument('--stride', type=int, default=4, help='Fit every stride-th star 3 grid point along each axis (warm and full levels only)')
-    parser.add_argument('--cpu', type=int, default=None, help='Worker processes for stage 2 of the full pipeline')
+    parser.add_argument('--cpu', type=int, default=6, help='Worker processes for stage 2 of the full pipeline')
     args = parser.parse_args()
 
     # Creating the photonic lantern model
@@ -310,8 +310,8 @@ if __name__ == '__main__':
     fitter = PhotonicLanternFitting(photonic_lantern_device, WAV_RANGE)
 
     # Grid of positions for star 3
-    x3s = np.linspace(-photonic_lantern_device.angular_extent, photonic_lantern_device.angular_extent, N_GRID_3)
-    y3s = np.linspace(-photonic_lantern_device.angular_extent, photonic_lantern_device.angular_extent, N_GRID_3)
+    x3s = np.linspace(-1*photonic_lantern_device.angular_extent, 1*photonic_lantern_device.angular_extent, N_GRID_3)
+    y3s = np.linspace(-1*photonic_lantern_device.angular_extent, 1*photonic_lantern_device.angular_extent, N_GRID_3)
 
     if args.level != 'linear':
         x3s, y3s = x3s[::args.stride], y3s[::args.stride]
